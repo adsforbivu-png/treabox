@@ -190,31 +190,47 @@ app.post("/extract", async (req, res) => {
 //  PAYMENT ROUTES
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.post("/create-order", async (req, res) => {
+/** Create a Razorpay Payment Link */
+app.post("/create-payment-link", async (req, res) => {
   const { amount } = req.body;
   try {
-    const options = {
-      amount: amount * 100, // in paise
+    const response = await razorpay.paymentLink.create({
+      amount: amount * 100,
       currency: "INR",
-      receipt: `receipt_${Date.now()}`,
-    };
-    const order = await razorpay.orders.create(options);
-    res.json(order);
+      accept_partial: false,
+      description: "LinkPlay 24-Hour Premium Pass",
+      customer: { name: "LinkPlay User", email: "user@linkplay.app", contact: "" },
+      notify: { sms: false, email: false },
+      reminder_enable: false,
+      notes: { app: "LinkPlay" },
+      callback_url: "https://web-production-b1fa09.up.railway.app/payment-success",
+      callback_method: "get"
+    });
+    res.json({ url: response.short_url, id: response.id });
   } catch (error) {
-    console.error("Razorpay Order Error:", error);
-    res.status(500).json({ error: "Could not create payment order" });
+    console.error("[Razorpay] Create Link Error:", error);
+    res.status(500).json({ error: "Could not create payment link" });
   }
 });
 
-app.post("/verify-payment", async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-  const hmac = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "placeholder_secret");
-  hmac.update(razorpay_order_id + "|" + razorpay_payment_id);
-  const generatedSignature = hmac.digest("hex");
-  if (generatedSignature === razorpay_signature) {
-    res.json({ success: true });
-  } else {
-    res.status(400).json({ success: false, error: "Invalid signature" });
+/** Simple callback page */
+app.get("/payment-success", (req, res) => {
+  res.send("<h1>Payment Successful!</h1><p>You can now return to the LinkPlay app.</p>");
+});
+
+/** Verify Payment Link Status */
+app.post("/verify-payment-status", async (req, res) => {
+  const { payment_link_id } = req.body;
+  try {
+    const response = await razorpay.paymentLink.fetch(payment_link_id);
+    if (response.status === "paid") {
+      res.json({ success: true });
+    } else {
+      res.json({ success: false, status: response.status });
+    }
+  } catch (error) {
+    console.error("[Razorpay] Verify Error:", error);
+    res.status(500).json({ error: "Verification failed" });
   }
 });
 
