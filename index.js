@@ -85,7 +85,7 @@ function findVideoInJson(obj, depth = 0) {
     }
   }
   if (typeof obj === "object") {
-    const priority = ["dlink", "download_link", "videoUrl", "video_url", "url", "src", "path", "downloadLink", "play_url", "m3u8_url"];
+    const priority = ["m3u8_url", "play_url", "stream_url", "dlink", "download_link", "videoUrl", "video_url", "url", "src", "path", "downloadLink"];
     for (const key of priority) {
       if (obj[key]) {
         const found = findVideoInJson(obj[key], depth + 1);
@@ -162,6 +162,20 @@ async function tryPuppeteer(shareUrl) {
   return foundVideoUrl;
 }
 
+async function followRedirects(url) {
+  try {
+    const res = await axios.get(url, {
+      headers: { 'User-Agent': BROWSER_UA, 'Referer': 'https://www.terabox.com/' },
+      maxRedirects: 10,
+      timeout: 8000,
+      validateStatus: s => s < 400,
+    });
+    return res.request?.res?.responseUrl || url;
+  } catch {
+    return url;
+  }
+}
+
 async function extractVideoUrl(shareUrl) {
   try { const url = await tryPublicAPI_A1(shareUrl); if (url) return url; } catch {}
   try { const url = await tryPublicAPI_A2(shareUrl); if (url) return url; } catch {}
@@ -179,10 +193,45 @@ app.post("/extract", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "url is required" });
   try {
-    const videoUrl = await extractVideoUrl(url);
+    let videoUrl = await extractVideoUrl(url);
+    // Follow redirects so the app gets the final CDN URL with a fresh token
+    if (videoUrl && !videoUrl.includes('.m3u8')) {
+      videoUrl = await followRedirects(videoUrl);
+    }
     return res.json({ videoUrl });
   } catch (err) {
     return res.status(500).json({ error: "Extraction failed", detail: err.message });
+  }
+});
+
+// Proxy endpoint — streams Terabox CDN video with proper auth headers,
+// forwarding range requests so seeking works.
+app.get("/proxy-video", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "url is required" });
+  try {
+    const headers = {
+      'User-Agent': BROWSER_UA,
+      'Referer': 'https://www.terabox.com/',
+      'Origin': 'https://www.terabox.com',
+    };
+    if (req.headers.range) headers['Range'] = req.headers.range;
+
+    const upstream = await axios.get(decodeURIComponent(url), {
+      headers,
+      responseType: 'stream',
+      maxRedirects: 10,
+      timeout: 30000,
+    });
+
+    res.setHeader('Content-Type', upstream.headers['content-type'] || 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+    if (upstream.headers['content-range']) res.setHeader('Content-Range', upstream.headers['content-range']);
+    res.status(upstream.status);
+    upstream.data.pipe(res);
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: "Proxy failed", detail: err.message });
   }
 });
 
