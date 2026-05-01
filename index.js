@@ -124,70 +124,85 @@ function findVideoInJson(obj, depth = 0) {
 //  STRATEGIES
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Calls Terabox's own public share API to get the full dlink.
-// This works without any account cookies for public (non-password) shares.
-// The sign+timestamp are returned by shorturlinfo itself, so no auth is needed.
-async function tryDirectAPI(shareUrl) {
-  const surlMatch = shareUrl.match(/\/s\/([^/?&#]+)/);
-  if (!surlMatch) return null;
-  const surl = surlMatch[1];
+// Extracts surl from any Terabox share URL format
+function extractSurl(shareUrl) {
+  const m = shareUrl.match(/\/s\/([^/?&#]+)/) || shareUrl.match(/surl=([^&]+)/);
+  return m ? m[1] : null;
+}
 
-  // Step 1: Get share metadata — returns shareid, uk, sign, timestamp even for anonymous users
+// Uses terabox.hnn.workers.dev's internal API (discovered from their page JS).
+// Calls /api/get-info-new then /api/get-downloadp for the full download link.
+async function tryWorkerA1(shareUrl) {
+  const surl = extractSurl(shareUrl);
+  if (!surl) return null;
+
   const infoRes = await axios.get(
-    `https://www.terabox.com/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1`,
-    { headers: BASE_HEADERS, timeout: 12000 }
+    `https://terabox.hnn.workers.dev/api/get-info-new?shorturl=${surl}`,
+    { headers: { "User-Agent": BROWSER_UA }, timeout: 12000 }
   );
   const info = infoRes.data;
-  if (info.errno !== 0 || !info.shareid || !info.uk) {
-    console.log("[DirectAPI] shorturlinfo errno:", info.errno);
-    return null;
-  }
+  if (!info.ok || !info.list?.length) return null;
 
-  // Step 2: Get file list
-  const listRes = await axios.get(
-    `https://www.terabox.com/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${info.shareid}&uk=${info.uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20`,
-    { headers: BASE_HEADERS, timeout: 12000 }
-  );
-  const list = listRes.data;
-  if (list.errno !== 0 || !list.list?.length) {
-    console.log("[DirectAPI] share/list errno:", list.errno);
-    return null;
-  }
-
-  // Prefer video file by extension
-  const videoFile = list.list.find(f => {
-    const name = (f.server_filename || "").toLowerCase();
+  const videoFile = info.list.find(f => {
+    const name = (f.filename || "").toLowerCase();
     return name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".flv") ||
            name.endsWith(".avi") || name.endsWith(".mov") || name.endsWith(".m4v");
-  }) || list.list[0];
+  }) || info.list[0];
 
   if (!videoFile?.fs_id) return null;
 
-  // Step 3: Get the signed full-download link using the sign from step 1
-  if (!info.sign || !info.timestamp) {
-    console.log("[DirectAPI] no sign/timestamp in shorturlinfo");
-    return null;
+  const payload = {
+    shareid: info.shareid,
+    uk: info.uk,
+    sign: info.sign,
+    timestamp: info.timestamp,
+    fs_id: videoFile.fs_id,
+    shorturl: info.shorturl || surl,
+    randsk: info.randsk || "",
+  };
+
+  // Try premium endpoint first (full video), fall back to regular
+  for (const ep of ["/api/get-downloadp", "/api/get-download"]) {
+    try {
+      const dlRes = await axios.post(`https://terabox.hnn.workers.dev${ep}`, payload, {
+        headers: { "User-Agent": BROWSER_UA, "Content-Type": "application/json" },
+        timeout: 15000,
+      });
+      const link = dlRes.data?.downloadLink;
+      if (link && link.startsWith("http")) {
+        console.log(`[WorkerA1] got link via ${ep} ✓`);
+        return link;
+      }
+    } catch {}
   }
-
-  const dlRes = await axios.get(
-    `https://www.terabox.com/api/download?app_id=250528&sign=${info.sign}&timestamp=${info.timestamp}&fs_id=${videoFile.fs_id}&uk=${info.uk}&shareid=${info.shareid}&channel=chunlei&web=1`,
-    { headers: BASE_HEADERS, timeout: 12000 }
-  );
-  const found = findVideoInJson(dlRes.data);
-  if (found) console.log("[DirectAPI] got dlink ✓");
-  return found;
+  return null;
 }
 
-async function tryPublicAPI_A1(shareUrl) {
-  const apiUrl = `https://terabox.hnn.workers.dev/?url=${encodeURIComponent(shareUrl)}`;
-  const res = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
-  return findVideoInJson(res.data);
-}
+// nepcoderdevs worker — also exposes an API under /api/
+async function tryWorkerA2(shareUrl) {
+  const surl = extractSurl(shareUrl);
+  if (!surl) return null;
 
-async function tryPublicAPI_A2(shareUrl) {
-  const apiUrl = `https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url=${encodeURIComponent(shareUrl)}`;
-  const res = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
-  return findVideoInJson(res.data);
+  // Try their API endpoint
+  try {
+    const infoRes = await axios.get(
+      `https://teraboxvideodownloader.nepcoderdevs.workers.dev/api/get-info?shorturl=${surl}`,
+      { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 }
+    );
+    const found = findVideoInJson(infoRes.data);
+    if (found) return found;
+  } catch {}
+
+  // Fall back to the root URL (might return JSON on some mirrors)
+  try {
+    const res = await axios.get(
+      `https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url=${encodeURIComponent(shareUrl)}`,
+      { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 }
+    );
+    if (typeof res.data === "object") return findVideoInJson(res.data);
+  } catch {}
+
+  return null;
 }
 
 async function tryPublicAPI_A3(shareUrl) {
@@ -256,10 +271,8 @@ async function followRedirects(url) {
 }
 
 async function extractVideoUrl(shareUrl) {
-  // Direct Terabox API first — returns dlink (full file), not play_url (preview)
-  try { const url = await tryDirectAPI(shareUrl); if (url) return url; } catch (e) { console.error("[DirectAPI]", e.message); }
-  try { const url = await tryPublicAPI_A1(shareUrl); if (url) return url; } catch {}
-  try { const url = await tryPublicAPI_A2(shareUrl); if (url) return url; } catch {}
+  try { const url = await tryWorkerA1(shareUrl); if (url) return url; } catch (e) { console.error("[WorkerA1]", e.message); }
+  try { const url = await tryWorkerA2(shareUrl); if (url) return url; } catch (e) { console.error("[WorkerA2]", e.message); }
   try { const url = await tryPublicAPI_A3(shareUrl); if (url) return url; } catch {}
   return await tryPuppeteer(shareUrl);
 }
@@ -276,24 +289,25 @@ app.get("/debug-extract", async (req, res) => {
   if (!url) return res.status(400).json({ error: "?url= required" });
 
   const results = {};
+  const surl = extractSurl(url);
+  results.surl = surl;
+
+  // Show raw info from worker A1's API
+  try {
+    const r = await axios.get(
+      `https://terabox.hnn.workers.dev/api/get-info-new?shorturl=${surl}`,
+      { headers: { "User-Agent": BROWSER_UA }, timeout: 12000 }
+    );
+    results.A1_info = r.data;
+  } catch (e) { results.A1_info_error = e.message; }
 
   try {
-    results.directAPI = await tryDirectAPI(url);
-  } catch (e) { results.directAPI_error = e.message; }
+    results.workerA1 = await tryWorkerA1(url);
+  } catch (e) { results.workerA1_error = e.message; }
 
   try {
-    const apiUrl = `https://terabox.hnn.workers.dev/?url=${encodeURIComponent(url)}`;
-    const r = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
-    results.A1_raw = r.data;
-    results.A1_picked = findVideoInJson(r.data);
-  } catch (e) { results.A1_error = e.message; }
-
-  try {
-    const apiUrl = `https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url=${encodeURIComponent(url)}`;
-    const r = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
-    results.A2_raw = r.data;
-    results.A2_picked = findVideoInJson(r.data);
-  } catch (e) { results.A2_error = e.message; }
+    results.workerA2 = await tryWorkerA2(url);
+  } catch (e) { results.workerA2_error = e.message; }
 
   return res.json(results);
 });
