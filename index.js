@@ -270,6 +270,34 @@ async function extractVideoUrl(shareUrl) {
 
 app.get("/", (req, res) => { res.json({ status: "LinkPlay backend ✅" }); });
 
+// Debug endpoint — shows raw response from each strategy so we can see what URLs are being returned
+app.get("/debug-extract", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "?url= required" });
+
+  const results = {};
+
+  try {
+    results.directAPI = await tryDirectAPI(url);
+  } catch (e) { results.directAPI_error = e.message; }
+
+  try {
+    const apiUrl = `https://terabox.hnn.workers.dev/?url=${encodeURIComponent(url)}`;
+    const r = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
+    results.A1_raw = r.data;
+    results.A1_picked = findVideoInJson(r.data);
+  } catch (e) { results.A1_error = e.message; }
+
+  try {
+    const apiUrl = `https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url=${encodeURIComponent(url)}`;
+    const r = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
+    results.A2_raw = r.data;
+    results.A2_picked = findVideoInJson(r.data);
+  } catch (e) { results.A2_error = e.message; }
+
+  return res.json(results);
+});
+
 app.post("/extract", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "url is required" });
