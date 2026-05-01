@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "9059a2a2-36ea-46b8-9e49-17496040456f"
+      }
+    },
+    "android": {
+      "package": "com.user.videoplay"
+    }
+  }
+}
