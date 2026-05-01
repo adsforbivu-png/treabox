@@ -24,6 +24,20 @@ app.use(express.json());
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+// Set TERABOX_COOKIE in Railway env vars to enable authenticated full-video extraction.
+// Get it from browser DevTools → Application → Cookies → terabox.com → copy all cookies as one string.
+const TERABOX_COOKIE = process.env.TERABOX_COOKIE || "";
+
+function getAuthHeaders() {
+  const h = {
+    "User-Agent": BROWSER_UA,
+    "Referer": "https://www.terabox.com/",
+    "Origin": "https://www.terabox.com",
+  };
+  if (TERABOX_COOKIE) h["Cookie"] = TERABOX_COOKIE;
+  return h;
+}
+
 const BLOCKED_HOSTS = [
   "google-analytics.com",
   "googletagmanager.com",
@@ -106,6 +120,63 @@ function findVideoInJson(obj, depth = 0) {
 //  STRATEGIES
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Authenticated Terabox API — only runs when TERABOX_COOKIE is set.
+// Calls Terabox's own API with the session cookie to get a full (non-preview) dlink.
+async function tryDirectAPI(shareUrl) {
+  if (!TERABOX_COOKIE) return null;
+
+  const surlMatch = shareUrl.match(/\/s\/([^/?&#]+)/);
+  if (!surlMatch) return null;
+  const surl = surlMatch[1];
+
+  const headers = getAuthHeaders();
+
+  // Step 1: Get share metadata (shareid, uk, sign, timestamp)
+  const infoRes = await axios.get(
+    `https://www.terabox.com/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1`,
+    { headers, timeout: 12000 }
+  );
+  const info = infoRes.data;
+  if (info.errno !== 0 || !info.shareid || !info.uk) {
+    console.log("[DirectAPI] shorturlinfo failed, errno:", info.errno);
+    return null;
+  }
+
+  // Step 2: Get file list
+  const listRes = await axios.get(
+    `https://www.terabox.com/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${info.shareid}&uk=${info.uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20`,
+    { headers, timeout: 12000 }
+  );
+  const list = listRes.data;
+  if (list.errno !== 0 || !list.list?.length) {
+    console.log("[DirectAPI] share/list failed, errno:", list.errno);
+    return null;
+  }
+
+  // Prefer video files
+  const videoFile = list.list.find(f => {
+    const name = (f.server_filename || "").toLowerCase();
+    return name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".flv") || name.endsWith(".avi") || name.endsWith(".mov");
+  }) || list.list[0];
+
+  if (!videoFile?.fs_id) return null;
+
+  // Step 3: Get signed download link
+  if (!info.sign || !info.timestamp) {
+    console.log("[DirectAPI] missing sign/timestamp");
+    return null;
+  }
+
+  const dlRes = await axios.get(
+    `https://www.terabox.com/api/download?app_id=250528&sign=${info.sign}&timestamp=${info.timestamp}&fs_id=${videoFile.fs_id}&uk=${info.uk}&shareid=${info.shareid}&channel=chunlei&web=1`,
+    { headers, timeout: 12000 }
+  );
+  const dlData = dlRes.data;
+  const found = findVideoInJson(dlData);
+  if (found) console.log("[DirectAPI] success, got dlink");
+  return found;
+}
+
 async function tryPublicAPI_A1(shareUrl) {
   const apiUrl = `https://terabox.hnn.workers.dev/?url=${encodeURIComponent(shareUrl)}`;
   const res = await axios.get(apiUrl, { headers: { "User-Agent": BROWSER_UA }, timeout: 10000 });
@@ -165,7 +236,7 @@ async function tryPuppeteer(shareUrl) {
 async function followRedirects(url) {
   try {
     const res = await axios.get(url, {
-      headers: { 'User-Agent': BROWSER_UA, 'Referer': 'https://www.terabox.com/' },
+      headers: getAuthHeaders(),
       maxRedirects: 10,
       timeout: 8000,
       validateStatus: s => s < 400,
@@ -177,6 +248,8 @@ async function followRedirects(url) {
 }
 
 async function extractVideoUrl(shareUrl) {
+  // Authenticated API first — gives full video, not preview
+  try { const url = await tryDirectAPI(shareUrl); if (url) return url; } catch (e) { console.error("[DirectAPI]", e.message); }
   try { const url = await tryPublicAPI_A1(shareUrl); if (url) return url; } catch {}
   try { const url = await tryPublicAPI_A2(shareUrl); if (url) return url; } catch {}
   try { const url = await tryPublicAPI_A3(shareUrl); if (url) return url; } catch {}
@@ -210,11 +283,7 @@ app.get("/proxy-video", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "url is required" });
   try {
-    const headers = {
-      'User-Agent': BROWSER_UA,
-      'Referer': 'https://www.terabox.com/',
-      'Origin': 'https://www.terabox.com',
-    };
+    const headers = getAuthHeaders();
     if (req.headers.range) headers['Range'] = req.headers.range;
 
     const upstream = await axios.get(decodeURIComponent(url), {
