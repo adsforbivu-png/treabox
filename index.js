@@ -29,6 +29,12 @@ const BASE_HEADERS = {
   "Origin": "https://www.terabox.com",
 };
 
+// Optional: set TERABOX_COOKIE in Railway env vars to fix errno 105 for randsk-protected shares.
+// Create a FREE dedicated Terabox account (not personal), log in, then in Chrome DevTools
+// → Application → Cookies → copy all as one string and paste here.
+// One service account works for all users — it's only used server-side to fetch public share links.
+const TERABOX_COOKIE = process.env.TERABOX_COOKIE || "";
+
 const BLOCKED_HOSTS = [
   "google-analytics.com",
   "googletagmanager.com",
@@ -143,31 +149,32 @@ async function tryDirectTeraboxAPI(shareUrl, _debug) {
     apiBase = `https://${h}`;
   } catch {}
 
-  // Step 0: Visit the share page on the correct domain to collect session cookies
-  let sessionCookie = "";
-  try {
-    const pageRes = await axios.get(`${apiBase}/s/${surl}`, {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      timeout: 15000,
-      maxRedirects: 5,
-      validateStatus: s => s < 500,
-    });
-    const cookies = pageRes.headers["set-cookie"] || [];
-    sessionCookie = cookies.map(c => c.split(";")[0]).join("; ");
-    // If we were redirected, update apiBase to the final domain
-    const finalUrl = pageRes.request?.res?.responseUrl;
-    if (finalUrl) {
-      try { apiBase = `https://${new URL(finalUrl).hostname}`; } catch {}
+  // Step 0: Build session cookie — use service account if set, else anonymous page visit
+  let sessionCookie = TERABOX_COOKIE;
+  if (!sessionCookie) {
+    try {
+      const pageRes = await axios.get(`${apiBase}/s/${surl}`, {
+        headers: {
+          "User-Agent": BROWSER_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout: 15000,
+        maxRedirects: 5,
+        validateStatus: s => s < 500,
+      });
+      const cookies = pageRes.headers["set-cookie"] || [];
+      sessionCookie = cookies.map(c => c.split(";")[0]).join("; ");
+      const finalUrl = pageRes.request?.res?.responseUrl;
+      if (finalUrl) {
+        try { apiBase = `https://${new URL(finalUrl).hostname}`; } catch {}
+      }
+    } catch (e) {
+      if (_debug) _debug.step0_error = e.message;
     }
-    if (_debug) _debug.step0_cookies = sessionCookie.slice(0, 120);
-    if (_debug) _debug.step0_apiBase = apiBase;
-  } catch (e) {
-    if (_debug) _debug.step0_error = e.message;
   }
+  if (_debug) _debug.step0_hasCookie = !!sessionCookie;
+  if (_debug) _debug.step0_apiBase = apiBase;
 
   const apiHeaders = {
     "User-Agent": BROWSER_UA,
@@ -247,16 +254,16 @@ async function tryPuppeteer(shareUrl) {
     const page = await browser.newPage();
     await page.setUserAgent(BROWSER_UA);
     await page.setViewport({ width: 1280, height: 800 });
+
     page.on("response", async (response) => {
       if (foundVideoUrl) return;
       const url = response.url();
-      if (response.status() !== 200) return;
       const ct = response.headers()["content-type"] || "";
       if (ct.includes("video/") && isRealVideoUrl(url)) { foundVideoUrl = url; return; }
       if (isTeraboxAPICall(url) || ct.includes("application/json")) {
         try {
           const text = await response.text();
-          if (text.includes("dlink") || text.includes("download")) {
+          if (text.includes("dlink") || text.includes("download") || text.includes("play_url")) {
             const data = JSON.parse(text);
             const found = findVideoInJson(data);
             if (found) foundVideoUrl = found;
@@ -264,15 +271,40 @@ async function tryPuppeteer(shareUrl) {
         } catch {}
       }
     });
+
     await page.setRequestInterception(true);
     page.on("request", (request) => {
       const url = request.url();
       if (BLOCKED_HOSTS.some((h) => url.includes(h))) { request.abort(); return; }
-      if (!foundVideoUrl && isRealVideoUrl(url)) foundVideoUrl = url;
       request.continue();
     });
+
     await page.goto(shareUrl, { waitUntil: "networkidle2", timeout: 35000 });
-    await new Promise((r) => setTimeout(r, 5000));
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Click play button to trigger the dlink/download API call
+    if (!foundVideoUrl) {
+      for (const sel of ['[class*="play-btn"]', '[class*="play_btn"]', 'button[class*="play"]', '[aria-label*="play" i]', 'video']) {
+        try { await page.click(sel); await new Promise(r => setTimeout(r, 3000)); break; } catch {}
+      }
+    }
+
+    // Use the browser's own session cookies to follow the dlink redirect
+    if (foundVideoUrl && !foundVideoUrl.includes("d.pcs.baidu.com") && !foundVideoUrl.endsWith(".mp4")) {
+      try {
+        const cookies = await page.cookies();
+        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+        const domain = new URL(shareUrl).hostname;
+        const dlRes = await axios.get(foundVideoUrl, {
+          headers: { "User-Agent": BROWSER_UA, "Referer": `https://${domain}/`, "Cookie": cookieStr },
+          maxRedirects: 10, timeout: 15000, validateStatus: s => s < 400,
+        });
+        const finalUrl = dlRes.request?.res?.responseUrl;
+        if (finalUrl && isRealVideoUrl(finalUrl)) foundVideoUrl = finalUrl;
+      } catch {}
+    }
+
+    if (!foundVideoUrl) await new Promise((r) => setTimeout(r, 3000));
   } finally {
     await browser.close();
   }
