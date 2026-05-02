@@ -190,10 +190,17 @@ async function tryDirectTeraboxAPI(shareUrl, _debug) {
   const { shareid, uk, sign, timestamp } = info;
   const randsk = info.randsk || "";
 
+  // randsk must be set as a cookie AND query param — Terabox validates both (errno 105 without cookie)
+  const cookieWithRandsk = sessionCookie
+    ? `${sessionCookie}; randsk=${encodeURIComponent(randsk)}`
+    : `randsk=${encodeURIComponent(randsk)}`;
+
+  const listHeaders = { ...apiHeaders, "Cookie": cookieWithRandsk };
+
   // Step 2: Get file list
   const listRes = await axios.get(
-    `${apiBase}/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${shareid}&uk=${uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20&randsk=${encodeURIComponent(randsk)}`,
-    { headers: apiHeaders, timeout: 12000 }
+    `${apiBase}/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${shareid}&uk=${uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20&dir=%2F&randsk=${encodeURIComponent(randsk)}`,
+    { headers: listHeaders, timeout: 12000 }
   );
   const list = listRes.data;
   if (_debug) _debug.step2_list = { errno: list.errno, count: list.list?.length };
@@ -211,10 +218,10 @@ async function tryDirectTeraboxAPI(shareUrl, _debug) {
   if (videoFile.dlink && isRealVideoUrl(videoFile.dlink)) return videoFile.dlink;
   if (!sign || !timestamp) return null;
 
-  // Step 3: Get signed download link
+  // Step 3: Get signed download link (also needs randsk cookie)
   const dlRes = await axios.get(
     `${apiBase}/api/download?app_id=250528&sign=${sign}&timestamp=${timestamp}&fs_id=${videoFile.fs_id}&uk=${uk}&shareid=${shareid}&channel=chunlei&web=1`,
-    { headers: apiHeaders, timeout: 12000 }
+    { headers: listHeaders, timeout: 12000 }
   );
   if (_debug) _debug.step3_download = JSON.stringify(dlRes.data).slice(0, 300);
   return findVideoInJson(dlRes.data);
