@@ -130,16 +130,23 @@ function extractSurl(shareUrl) {
   return m ? m[1] : null;
 }
 
-// Visits the share page first to get anonymous session cookies Terabox sets on any visit,
-// then uses those cookies to call Terabox's own API and get the full dlink (not preview).
-async function tryDirectTeraboxAPI(shareUrl) {
+// Visits the share page to collect session cookies, then calls the API on the same domain.
+// Works for terabox.com, terafileshare.com, teraboxapp.com, 1024terabox.com, etc.
+async function tryDirectTeraboxAPI(shareUrl, _debug) {
   const surl = extractSurl(shareUrl);
   if (!surl) return null;
 
-  // Step 0: Visit the share page to get session cookies (BAIDUID, PANPSC, etc.)
+  // Detect the domain from the share URL — all Terabox variants share the same API structure
+  let apiBase = "https://www.terabox.com";
+  try {
+    const h = new URL(shareUrl).hostname;
+    apiBase = `https://${h}`;
+  } catch {}
+
+  // Step 0: Visit the share page on the correct domain to collect session cookies
   let sessionCookie = "";
   try {
-    const pageRes = await axios.get(`https://www.terabox.com/s/${surl}`, {
+    const pageRes = await axios.get(`${apiBase}/s/${surl}`, {
       headers: {
         "User-Agent": BROWSER_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -151,25 +158,33 @@ async function tryDirectTeraboxAPI(shareUrl) {
     });
     const cookies = pageRes.headers["set-cookie"] || [];
     sessionCookie = cookies.map(c => c.split(";")[0]).join("; ");
-    console.log("[DirectAPI] got session cookies:", sessionCookie.slice(0, 80));
+    // If we were redirected, update apiBase to the final domain
+    const finalUrl = pageRes.request?.res?.responseUrl;
+    if (finalUrl) {
+      try { apiBase = `https://${new URL(finalUrl).hostname}`; } catch {}
+    }
+    if (_debug) _debug.step0_cookies = sessionCookie.slice(0, 120);
+    if (_debug) _debug.step0_apiBase = apiBase;
   } catch (e) {
-    console.log("[DirectAPI] page fetch failed:", e.message);
+    if (_debug) _debug.step0_error = e.message;
   }
 
   const apiHeaders = {
-    ...BASE_HEADERS,
+    "User-Agent": BROWSER_UA,
+    "Referer": `${apiBase}/`,
+    "Origin": apiBase,
     "Accept": "application/json, */*",
     "Accept-Language": "en-US,en;q=0.9",
     ...(sessionCookie ? { "Cookie": sessionCookie } : {}),
   };
 
-  // Step 1: Get share metadata (shareid, uk, sign, timestamp, randsk)
+  // Step 1: Get share metadata
   const infoRes = await axios.get(
-    `https://www.terabox.com/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&web=1`,
+    `${apiBase}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&web=1`,
     { headers: apiHeaders, timeout: 12000 }
   );
   const info = infoRes.data;
-  console.log("[DirectAPI] shorturlinfo errno:", info.errno, "shareid:", info.shareid);
+  if (_debug) _debug.step1_info = { errno: info.errno, shareid: info.shareid, uk: info.uk, hasSign: !!info.sign, hasRandsk: !!info.randsk };
   if (info.errno !== 0 || !info.shareid || !info.uk) return null;
 
   const { shareid, uk, sign, timestamp } = info;
@@ -177,14 +192,12 @@ async function tryDirectTeraboxAPI(shareUrl) {
 
   // Step 2: Get file list
   const listRes = await axios.get(
-    `https://www.terabox.com/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${shareid}&uk=${uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20&randsk=${encodeURIComponent(randsk)}`,
+    `${apiBase}/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${shareid}&uk=${uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20&randsk=${encodeURIComponent(randsk)}`,
     { headers: apiHeaders, timeout: 12000 }
   );
   const list = listRes.data;
-  if (list.errno !== 0 || !list.list?.length) {
-    console.log("[DirectAPI] list errno:", list.errno);
-    return null;
-  }
+  if (_debug) _debug.step2_list = { errno: list.errno, count: list.list?.length };
+  if (list.errno !== 0 || !list.list?.length) return null;
 
   const videoFile = list.list.find(f => {
     const name = (f.server_filename || "").toLowerCase();
@@ -193,21 +206,17 @@ async function tryDirectTeraboxAPI(shareUrl) {
   }) || list.list[0];
 
   if (!videoFile?.fs_id) return null;
+  if (_debug) _debug.step2_file = { name: videoFile.server_filename, fs_id: videoFile.fs_id, hasDlink: !!videoFile.dlink };
 
-  // Some shares include dlink directly in the file list
-  if (videoFile.dlink && isRealVideoUrl(videoFile.dlink)) {
-    console.log("[DirectAPI] dlink from file list ✓");
-    return videoFile.dlink;
-  }
-
+  if (videoFile.dlink && isRealVideoUrl(videoFile.dlink)) return videoFile.dlink;
   if (!sign || !timestamp) return null;
 
-  // Step 3: Get the signed download link
+  // Step 3: Get signed download link
   const dlRes = await axios.get(
-    `https://www.terabox.com/api/download?app_id=250528&sign=${sign}&timestamp=${timestamp}&fs_id=${videoFile.fs_id}&uk=${uk}&shareid=${shareid}&channel=chunlei&web=1`,
+    `${apiBase}/api/download?app_id=250528&sign=${sign}&timestamp=${timestamp}&fs_id=${videoFile.fs_id}&uk=${uk}&shareid=${shareid}&channel=chunlei&web=1`,
     { headers: apiHeaders, timeout: 12000 }
   );
-  console.log("[DirectAPI] download response:", JSON.stringify(dlRes.data).slice(0, 300));
+  if (_debug) _debug.step3_download = JSON.stringify(dlRes.data).slice(0, 300);
   return findVideoInJson(dlRes.data);
 }
 
@@ -278,7 +287,6 @@ async function followRedirects(url) {
 
 async function extractVideoUrl(shareUrl) {
   try { const url = await tryDirectTeraboxAPI(shareUrl); if (url) return url; } catch (e) { console.error("[DirectAPI]", e.message); }
-  try { const url = await tryPublicAPI_A3(shareUrl); if (url) return url; } catch {}
   return await tryPuppeteer(shareUrl);
 }
 
@@ -297,13 +305,11 @@ app.get("/debug-extract", async (req, res) => {
   const surl = extractSurl(url);
   results.surl = surl;
 
+  const dbg = {};
   try {
-    results.directAPI = await tryDirectTeraboxAPI(url);
+    results.directAPI = await tryDirectTeraboxAPI(url, dbg);
   } catch (e) { results.directAPI_error = e.message; }
-
-  try {
-    results.A3 = await tryPublicAPI_A3(url);
-  } catch (e) { results.A3_error = e.message; }
+  results.directAPI_steps = dbg;
 
   return res.json(results);
 });
