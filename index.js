@@ -178,28 +178,29 @@ async function tryDirectTeraboxAPI(shareUrl, _debug) {
     ...(sessionCookie ? { "Cookie": sessionCookie } : {}),
   };
 
-  // Step 1: Get share metadata
+  // Step 1: Get share metadata — response also sets randsk via Set-Cookie
   const infoRes = await axios.get(
     `${apiBase}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&web=1`,
     { headers: apiHeaders, timeout: 12000 }
   );
   const info = infoRes.data;
+
+  // Capture cookies Terabox sets in the shorturlinfo response (includes randsk)
+  const infoCookies = (infoRes.headers["set-cookie"] || []).map(c => c.split(";")[0]).join("; ");
+  const mergedCookies = [sessionCookie, infoCookies].filter(Boolean).join("; ");
+  if (_debug) _debug.step1_setCookies = infoCookies;
   if (_debug) _debug.step1_info = { errno: info.errno, shareid: info.shareid, uk: info.uk, hasSign: !!info.sign, hasRandsk: !!info.randsk };
   if (info.errno !== 0 || !info.shareid || !info.uk) return null;
 
   const { shareid, uk, sign, timestamp } = info;
   const randsk = info.randsk || "";
 
-  // randsk must be set as a cookie AND query param — Terabox validates both (errno 105 without cookie)
-  const cookieWithRandsk = sessionCookie
-    ? `${sessionCookie}; randsk=${encodeURIComponent(randsk)}`
-    : `randsk=${encodeURIComponent(randsk)}`;
-
-  const listHeaders = { ...apiHeaders, "Cookie": cookieWithRandsk };
+  // Use merged cookies (session + shorturlinfo response cookies) for all subsequent calls
+  const listHeaders = { ...apiHeaders, "Cookie": mergedCookies };
 
   // Step 2: Get file list
   const listRes = await axios.get(
-    `${apiBase}/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${shareid}&uk=${uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20&dir=%2F&randsk=${encodeURIComponent(randsk)}`,
+    `${apiBase}/share/list?app_id=250528&shorturl=${surl}&root=1&shareid=${shareid}&uk=${uk}&order=name&desc=0&showempty=0&web=1&page=1&num=20&dir=%2F`,
     { headers: listHeaders, timeout: 12000 }
   );
   const list = listRes.data;
